@@ -1,8 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-import os, uuid, zipfile, re
-from supabase_client import supabase
 from gradio_client import Client, handle_file
+from supabase_client import supabase  # Make sure this file exists and is correct
+import os, uuid, zipfile, re, shutil
 
 app = FastAPI()
 
@@ -12,10 +12,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(ALBUM_DIR, exist_ok=True)
 
 # --- CONFIGURATION ---
-# REPLACE THIS URL with your actual Hugging Face Space URL!
-# Example: "username/evizon-ai-worker"
+# REPLACE THIS WITH YOUR EXACT HUGGING FACE SPACE ID
+# Example: "sombits/evizon-ai-worker"
 HF_SPACE_ID = "anon8055/evizon-ai-worker" 
-hf_client = Client(HF_SPACE_ID)
+
+# Initialize Client
+try:
+    hf_client = Client(HF_SPACE_ID)
+    print(f"✅ Connected to AI Worker: {HF_SPACE_ID}")
+except Exception as e:
+    print(f"⚠️ Warning: Could not connect to Hugging Face. Check your Internet or Space ID. Error: {e}")
+    hf_client = None
 
 # ---------- Helper functions ----------
 def extract_year_from_text(text: str) -> str:
@@ -27,14 +34,17 @@ def extract_year_from_text(text: str) -> str:
 
 @app.get("/")
 def home():
-    # Serve the frontend HTML instead of the JSON message
+    # Serve the frontend HTML
     if os.path.exists("frontend/index.html"):
         with open("frontend/index.html", "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
-    return {"message": "Frontend not found, but Backend is active."}
+    return {"message": "Frontend file not found, but Backend is active."}
 
 @app.post("/upload")
 async def upload_photo(file: UploadFile = File(...)):
+    if not hf_client:
+        return {"error": "AI Server not connected. Check server logs."}
+
     # 1. Save locally first
     img_bytes = await file.read()
     photo_id = str(uuid.uuid4())
@@ -45,18 +55,23 @@ async def upload_photo(file: UploadFile = File(...)):
         f.write(img_bytes)
 
     # 2. Send to Hugging Face for Analysis
-    print(f"Sending {filename} to AI Worker...")
+    print(f"🚀 Sending {filename} to AI Worker...")
+    tags = {}
+    
     try:
-        # This calls the 'predict' function on your HF Space
+        # NOTE: If '/predict' fails, check your HF Space "Use via API" button 
+        # to see if the name is different (e.g., '/predict_1')
         result = hf_client.predict(
             image_path=handle_file(temp_path),
-            api_name="/predict"
+            api_name="/process_image" 
         )
-        # Result is already a JSON dictionary (tags)
-        tags = result
+        tags = result # Result is already a Dict/JSON from our HF app
+        print("✅ AI Analysis Complete:", tags)
+        
     except Exception as e:
-        print(f"AI Error: {e}")
-        return {"error": "AI Processing Failed", "details": str(e)}
+        print(f"❌ AI Error: {e}")
+        # IMPORTANT: We don't stop here. We save the file anyway so you don't lose data.
+        tags = {"event_text": "Unknown", "is_blurry": False, "hash": ""}
 
     # 3. Process results
     event_name = tags.get("event_text", "Unknown")
@@ -67,28 +82,30 @@ async def upload_photo(file: UploadFile = File(...)):
     os.makedirs(event_folder, exist_ok=True)
     final_path = f"{event_folder}/{filename}"
     
-    # Move file (rewrite bytes)
     with open(final_path, "wb") as f:
         f.write(img_bytes)
 
     # 5. Insert to Supabase
-    supabase.table("event_photos").insert({
-        "id": photo_id,
-        "photo_url": final_path,
-        "event_name": event_name,
-        "department": "Unknown",
-        "event_date": None,
-        "category": "general",
-        "cluster_id": -1, # Clustering disabled to save RAM
-        "is_blurry": tags.get("is_blurry", False),
-        "hash": tags.get("hash", "")
-    }).execute()
+    try:
+        supabase.table("event_photos").insert({
+            "id": photo_id,
+            "photo_url": final_path,
+            "event_name": event_name,
+            "department": "Unknown",
+            "event_date": None,
+            "category": "general",
+            "cluster_id": -1, 
+            "is_blurry": tags.get("is_blurry", False),
+            "hash": tags.get("hash", "")
+        }).execute()
+    except Exception as db_error:
+        print(f"⚠️ Database Error: {db_error}")
 
-    os.remove(temp_path)
+    # Cleanup temp file
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+
     return {"status": "uploaded", "event": event_name, "year": year}
-
-# --- LIGHTWEIGHT SEARCH ENDPOINTS ---
-# (These don't use RAM, so they are fine to keep)
 
 @app.get("/filter")
 def filter_photos(event: str = None, department: str = None, date: str = None):
@@ -98,31 +115,68 @@ def filter_photos(event: str = None, department: str = None, date: str = None):
     if date: query = query.eq("event_date", date)
     return {"results": query.execute().data}
 
+@app.get("/filter-search")
+def filter_photos_advanced(event: str = None, department: str = None, date: str = None, category: str = None):
+    query = supabase.table("event_photos").select("*")
+    if event: query = query.ilike("event_name", f"%{event}%")
+    if department: query = query.eq("department", department)
+    if date: query = query.eq("event_date", date)
+    if category: query = query.eq("category", category)
+    
+    data = query.execute().data
+    return {"count": len(data), "results": data}
+
 @app.get("/search")
 def natural_search(q: str = Query(...)):
-    # Simplified search logic
     q_lower = q.lower()
     dept_match = re.search(r"\b(cse|ece|eee|me)\b", q_lower)
     department = dept_match.group(1).upper() if dept_match else None
     
     query = supabase.table("event_photos").select("*")
     if department: query = query.eq("department", department)
-    
-    # Basic text match on event name since we don't have the clean function locally anymore
-    # (Or you can duplicate the simple clean string function here if you want)
-    if not department:
-         query = query.ilike("event_name", f"%{q}%")
+    if not department: query = query.ilike("event_name", f"%{q}%")
          
     results = query.execute().data
     return {"query": q, "results": results}
 
+@app.post("/make-album")
+def make_album(event: str):
+    rows = supabase.table("event_photos").select("photo_url, event_name").execute().data
+    photos = [r["photo_url"] for r in rows if (r["event_name"] or "").lower() == event.lower()]
+
+    zip_path = f"{ALBUM_DIR}/{event}_album.zip"
+    os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for photo in photos:
+            if os.path.exists(photo):
+                zipf.write(photo, arcname=photo.split("/")[-1])
+
+    return {"album_zip": zip_path, "photo_count": len(photos)}
+
+@app.get("/download-album")
+def download_album(event: str = Query(...)):
+    zip_path = f"{ALBUM_DIR}/{event}_album.zip"
+    if not os.path.exists(zip_path):
+        return JSONResponse({"error": "Album ZIP not found"}, status_code=404)
+    return FileResponse(zip_path, filename=f"{event}_album.zip", media_type="application/zip")
+
 @app.get("/uploads/{filename}")
 def serve_image(filename: str):
-    # This might break if files are moved to 'albums/...' 
-    # but keeping it for compatibility with your frontend
-    path = os.path.join(UPLOAD_DIR, filename) 
-    if not os.path.exists(path): return JSONResponse({"error": "Not found"}, 404)
-    return FileResponse(path)
+    # Try finding it in uploads first
+    path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(path):
+        return FileResponse(path)
+    
+    # If not in uploads, it might be deep inside albums/event/year/filename
+    # For the hackathon, we will just try to find it by name walk
+    for root, dirs, files in os.walk(ALBUM_DIR):
+        if filename in files:
+            return FileResponse(os.path.join(root, filename))
+            
+    return JSONResponse({"error": "Not found"}, 404)
 
-# NOTE: /cluster endpoint removed because it requires Pytorch/GPU
-# If you need it for the demo, use the 'ngrok' method instead.
+# UI Route for specifically /ui (redirects to home)
+@app.get("/ui")
+def ui_redirect():
+    return home()
