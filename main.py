@@ -27,7 +27,11 @@ def extract_year_from_text(text: str) -> str:
 
 @app.get("/")
 def home():
-    return {"message": "Evizon backend active (Lightweight Mode)."}
+    # Serve the frontend HTML instead of the JSON message
+    if os.path.exists("frontend/index.html"):
+        with open("frontend/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return {"message": "Frontend not found, but Backend is active."}
 
 @app.post("/upload")
 async def upload_photo(file: UploadFile = File(...)):
